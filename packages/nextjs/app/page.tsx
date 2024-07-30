@@ -1,121 +1,228 @@
 "use client";
 
-import { useState } from "react";
-import Link from "next/link";
-import { useDynamicContext } from "@dynamic-labs/sdk-react-core";
+import { useEffect, useState } from "react";
+import { ethers } from "ethers";
 import type { NextPage } from "next";
-import { BugAntIcon, MagnifyingGlassIcon } from "@heroicons/react/24/outline";
-import { Address } from "~~/components/scaffold-eth";
-import { sendTransaction, signMessage } from "~~/lib/dynamic";
+import { useAccount } from "wagmi";
+import { Address, AddressInput } from "~~/components/scaffold-eth";
+import {
+  useDeployedContractInfo,
+  useScaffoldEventHistory,
+  useScaffoldReadContract,
+  useScaffoldWatchContractEvent,
+  useScaffoldWriteContract,
+} from "~~/hooks/scaffold-eth";
 
 const Home: NextPage = () => {
-  const { primaryWallet, networkConfigurations } = useDynamicContext();
-  const [messageSignature, setMessageSignature] = useState<string>("");
-  const [transactionSignature, setTransactionSignature] = useState<string>("");
-  const connectedAddress = primaryWallet?.address;
+  const { address } = useAccount();
+  const [betAmount, setBetAmount] = useState<string>("");
+  const [betType, setBetType] = useState<number>(0);
+  const [isLoading, setIsLoading] = useState(false);
+  const [nextClaimTime, setNextClaimTime] = useState<Date | null>(null);
+  const [freeBalance, setFreeBalance] = useState<string>("0");
+  const [gameResult, setGameResult] = useState<string | null>(null);
+  const [gameHistory, setGameHistory] = useState<string[]>([]);
+  const [approvalAmount, setApprovalAmount] = useState<string>("");
+  const [handResults, setHandResults] = useState<{ playerHand: number[]; bankerHand: number[] } | null>(null);
 
-  const handleSignMesssage = async () => {
-    try {
-      const signature = await signMessage("Hello World", primaryWallet);
-      setMessageSignature(signature);
+  const { writeContractAsync: placeBet } = useScaffoldWriteContract("BaccaratGame");
+  const { writeContractAsync: claimTokens } = useScaffoldWriteContract("FreeChips");
+  const { writeContractAsync: approveTokens } = useScaffoldWriteContract("FreeChips");
+  const { data: nextClaimTimeData, refetch: refetchNextClaimTime } = useScaffoldReadContract({
+    contractName: "FreeChips",
+    functionName: "getNextClaimTime",
+    args: [address],
+  });
 
-      setTimeout(() => {
-        setMessageSignature("");
-      }, 10000);
-    } catch (e) {
-      console.error(e);
+  const { data: freeBalanceData, refetch: refetchFreeBalance } = useScaffoldReadContract({
+    contractName: "FreeChips",
+    functionName: "balanceOf",
+    args: [address],
+  });
+
+  const { data: baccaratGameContract } = useDeployedContractInfo("BaccaratGame");
+
+  const { data: allowanceData, refetch: refetchAllowance } = useScaffoldReadContract({
+    contractName: "FreeChips",
+    functionName: "allowance",
+    args: [address, baccaratGameContract?.address],
+  });
+
+  useEffect(() => {
+    if (nextClaimTimeData) {
+      setNextClaimTime(new Date(Number(nextClaimTimeData) * 1000));
     }
-  };
+  }, [nextClaimTimeData]);
 
-  const handleSendTransaction = async () => {
-    try {
-      const isTestnet = await primaryWallet?.connector?.isTestnet();
-      if (!isTestnet) {
-        alert("You're not on a testnet, proceed with caution.");
+  useEffect(() => {
+    if (freeBalanceData) {
+      setFreeBalance(ethers.utils.formatUnits(freeBalanceData, 18));
+    }
+  }, [freeBalanceData]);
+
+  useScaffoldWatchContractEvent({
+    contractName: "BaccaratGame",
+    eventName: "GameCompleted",
+    listener: (gameId, winner, playerHand, bankerHand) => {
+      const result = `Game ${gameId} completed. Winner: ${["Player", "Banker", "Tie"][winner]}`;
+      setGameResult(result);
+      setGameHistory(prev => [result, ...prev.slice(0, 4)]);
+      setHandResults({ playerHand: playerHand.map(Number), bankerHand: bankerHand.map(Number) });
+    },
+  });
+
+  useScaffoldWatchContractEvent({
+    contractName: "BaccaratGame",
+    eventName: "Payout",
+    listener: (player, amount) => {
+      if (player === address) {
+        const result = `You won ${ethers.utils.formatUnits(amount, 18)} FREE!`;
+        setGameResult(result);
+        setGameHistory(prev => [result, ...prev.slice(0, 4)]);
+        refetchFreeBalance();
       }
-      const hash = await sendTransaction(connectedAddress, "0.0001", primaryWallet, networkConfigurations);
-      setTransactionSignature(hash);
+    },
+  });
 
-      setTimeout(() => {
-        setTransactionSignature("");
-      }, 10000);
-    } catch (e) {
-      console.error(e);
+  const { data: pastEvents } = useScaffoldEventHistory({
+    contractName: "BaccaratGame",
+    eventName: "GameCompleted",
+    fromBlock: Number(process.env.NEXT_PUBLIC_DEPLOY_BLOCK) || 0,
+    toBlock: "latest",
+    blockData: true,
+  });
+
+  useEffect(() => {
+    if (pastEvents) {
+      const formattedEvents = pastEvents.map(
+        event =>
+          `Game ${event.args.gameId} completed. Winner: ${["Player", "Banker", "Tie"][event.args.winner]} (Block: ${
+            event.blockNumber
+          })`,
+      );
+      setGameHistory(formattedEvents.slice(0, 5));
+    }
+  }, [pastEvents]);
+
+  const handlePlaceBet = async () => {
+    if (!betAmount) return;
+    setIsLoading(true);
+    try {
+      // Generate a random commitment
+      const commitment = ethers.utils.randomBytes(32);
+
+      await placeBet({
+        functionName: "placeBet",
+        args: [betType, ethers.utils.parseUnits(betAmount, 18), commitment],
+      });
+      console.log("Bet placed successfully!");
+      setGameResult(null);
+    } catch (error) {
+      console.error("Error placing bet:", error);
+      setGameResult("Error placing bet. Please try again.");
+    } finally {
+      setIsLoading(false);
+      refetchFreeBalance();
+      refetchAllowance();
     }
   };
+
+  const handleClaimTokens = async () => {
+    setIsLoading(true);
+    try {
+      await claimTokens({ functionName: "claimTokens" });
+      console.log("Tokens claimed successfully!");
+      refetchNextClaimTime();
+      refetchFreeBalance();
+    } catch (error) {
+      console.error("Error claiming tokens:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleApproveTokens = async () => {
+    if (!approvalAmount || !baccaratGameContract) return;
+    setIsLoading(true);
+    try {
+      await approveTokens({
+        functionName: "approve",
+        args: [baccaratGameContract.address, ethers.utils.parseUnits(approvalAmount, 18)],
+      });
+      console.log("Tokens approved successfully!");
+      refetchAllowance();
+    } catch (error) {
+      console.error("Error approving tokens:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const canClaimTokens = nextClaimTime ? new Date() >= nextClaimTime : false;
 
   return (
-    <>
-      <div className="flex items-center flex-col flex-grow pt-10">
-        <div className="px-5">
-          <h1 className="text-center">
-            <span className="block text-2xl mb-2">Welcome to</span>
-            <span className="block text-4xl font-bold">Scaffold-ETH 2</span>
-          </h1>
-          <div className="flex justify-center items-center space-x-2 flex-col sm:flex-row">
-            <p className="my-2 font-medium">Connected Address:</p>
-            <Address address={connectedAddress} />
-          </div>
-          {primaryWallet && !transactionSignature && (
-            <div className="flex justify-center items-center space-x-2 flex-col sm:flex-row">
-              <button onClick={() => handleSendTransaction()} className="btn btn-primary">
-                Send 0.001 ETH to yourself
-              </button>
-              <button onClick={() => handleSignMesssage()} className="btn btn-primary">
-                Sign Hello World
-              </button>
-            </div>
-          )}
-          {primaryWallet && messageSignature && (
-            <p className="text-center-text-lg">Message signed! {messageSignature}</p>
-          )}
-          {primaryWallet && transactionSignature && (
-            <p className="text-center-text-lg">Transaction processed! {transactionSignature}</p>
-          )}
-          <p className="text-center text-lg">
-            Get started by editing{" "}
-            <code className="italic bg-base-300 text-base font-bold max-w-full break-words break-all inline-block">
-              packages/nextjs/app/page.tsx
-            </code>
-          </p>
-          <p className="text-center text-lg">
-            Edit your smart contract{" "}
-            <code className="italic bg-base-300 text-base font-bold max-w-full break-words break-all inline-block">
-              YourContract.sol
-            </code>{" "}
-            in{" "}
-            <code className="italic bg-base-300 text-base font-bold max-w-full break-words break-all inline-block">
-              packages/hardhat/contracts
-            </code>
+    <div className="flex items-center flex-col flex-grow pt-10">
+      <div className="px-5">
+        <h1 className="text-center mb-8">
+          <span className="block text-2xl mb-2">Welcome to</span>
+          <span className="block text-4xl font-bold">Baccarat Game</span>
+        </h1>
+        <div className="flex justify-center items-center space-x-2 flex-col sm:flex-row">
+          <p className="my-2 font-medium">Connected Address:</p>
+          <Address address={address} />
+        </div>
+        <div className="mt-4 text-center">
+          <p className="font-medium">Your FREE Balance: {freeBalance} FREE</p>
+          <p className="font-medium">
+            Current Allowance: {allowanceData ? ethers.utils.formatUnits(allowanceData, 18) : "0"} FREE
           </p>
         </div>
-
-        <div className="flex-grow bg-base-300 w-full mt-16 px-8 py-12">
-          <div className="flex justify-center items-center gap-12 flex-col sm:flex-row">
-            <div className="flex flex-col bg-base-100 px-10 py-10 text-center items-center max-w-xs rounded-3xl">
-              <BugAntIcon className="h-8 w-8 fill-secondary" />
-              <p>
-                Tinker with your smart contract using the{" "}
-                <Link href="/debug" passHref className="link">
-                  Debug Contracts
-                </Link>{" "}
-                tab.
-              </p>
+        <div className="mt-8 flex flex-col items-center">
+          <button className="btn btn-primary mb-4" onClick={handleClaimTokens} disabled={!canClaimTokens || isLoading}>
+            {isLoading ? "Claiming..." : "Claim FREE Tokens"}
+          </button>
+          {nextClaimTime && <p className="text-sm mb-4">Next claim available: {nextClaimTime.toLocaleString()}</p>}
+          <AddressInput
+            value={approvalAmount}
+            placeholder="Approval Amount (FREE)"
+            onChange={value => setApprovalAmount(value)}
+          />
+          <button className="btn btn-secondary mb-4" onClick={handleApproveTokens} disabled={isLoading}>
+            {isLoading ? "Approving..." : "Approve FREE Tokens"}
+          </button>
+          <AddressInput value={betAmount} placeholder="Bet Amount (FREE)" onChange={value => setBetAmount(value)} />
+          <select
+            value={betType}
+            onChange={e => setBetType(Number(e.target.value))}
+            className="select select-bordered w-full max-w-xs my-4"
+          >
+            <option value={0}>Player</option>
+            <option value={1}>Banker</option>
+            <option value={2}>Tie</option>
+          </select>
+          <button className="btn btn-primary" onClick={handlePlaceBet} disabled={isLoading}>
+            {isLoading ? "Placing Bet..." : "Place Bet"}
+          </button>
+          {gameResult && <p className="mt-4 text-lg font-semibold">{gameResult}</p>}
+          {handResults && (
+            <div className="mt-4">
+              <p>Player Hand: {handResults.playerHand.join(", ")}</p>
+              <p>Banker Hand: {handResults.bankerHand.join(", ")}</p>
             </div>
-            <div className="flex flex-col bg-base-100 px-10 py-10 text-center items-center max-w-xs rounded-3xl">
-              <MagnifyingGlassIcon className="h-8 w-8 fill-secondary" />
-              <p>
-                Explore your local transactions with the{" "}
-                <Link href="/blockexplorer" passHref className="link">
-                  Block Explorer
-                </Link>{" "}
-                tab.
-              </p>
-            </div>
+          )}
+          <div className="mt-8">
+            <h2 className="text-xl font-bold mb-2">Recent Games</h2>
+            <ul>
+              {gameHistory.map((game, index) => (
+                <li key={index} className="mb-1">
+                  {game}
+                </li>
+              ))}
+            </ul>
           </div>
         </div>
       </div>
-    </>
+    </div>
   );
 };
 

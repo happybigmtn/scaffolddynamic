@@ -7,7 +7,7 @@ import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20PermitUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
-contract Chips is Initializable, ERC20Upgradeable, ERC20PausableUpgradeable, OwnableUpgradeable, ERC20PermitUpgradeable {
+contract FreeChips is Initializable, ERC20Upgradeable, ERC20PausableUpgradeable, OwnableUpgradeable, ERC20PermitUpgradeable {
     uint256 private constant INITIAL_SUPPLY = 1_000_000_000 * 10**18; // 1 billion tokens with 18 decimals
     uint256 private constant L1_BLOCKS_PER_YEAR = 31_557_600 / 12; // ≈ 2,629,800
     uint256 public constant TOKENS_PER_BLOCK = 10 * 10**18; // 1 token per L2 block with 18 decimals
@@ -25,6 +25,7 @@ contract Chips is Initializable, ERC20Upgradeable, ERC20PausableUpgradeable, Own
     mapping(address => Claim) public userClaims;
     mapping(uint256 => uint256) public epochClaimants;
     mapping(uint256 => uint256) public epochTotalTokens;
+    mapping(address => uint256) public lastClaimTime;
     event TokensClaimed(address indexed user, uint256 amount, uint256 epoch);
     event TokensAccumulated(uint256 newTokens, uint256 totalAccumulated);
 
@@ -45,22 +46,17 @@ contract Chips is Initializable, ERC20Upgradeable, ERC20PausableUpgradeable, Own
     }
 
     function claimTokens() external whenNotPaused {
-        uint256 userLastEpoch = userClaims[msg.sender].epoch;
-        uint256 newCurrentEpoch = getCurrentEpoch();
-        require(newCurrentEpoch > userLastEpoch, "Must wait for next epoch to claim");
+        require(block.timestamp >= lastClaimTime[msg.sender] + CLAIM_COOLDOWN, "Must wait 24 hours between claims");
 
-        _updateAccumulatedTokens();
+        uint256 tokensToDistribute = TOKENS_PER_BLOCK * CLAIM_COOLDOWN;
+        _mint(msg.sender, tokensToDistribute);
 
-        for (uint256 i = userLastEpoch + 1; i <= newCurrentEpoch; i++) {
-            epochClaimants[i]++;
-        }
+        lastClaimTime[msg.sender] = block.timestamp;
+        emit TokensClaimed(msg.sender, tokensToDistribute, getCurrentEpoch());
+    }
 
-        userClaims[msg.sender] = Claim(newCurrentEpoch, 0);
-
-        if (newCurrentEpoch > currentEpoch) {
-            _distributePreviousEpochs(newCurrentEpoch);
-            currentEpoch = newCurrentEpoch;
-        }
+    function getNextClaimTime(address user) public view returns (uint256) {
+        return lastClaimTime[user] + CLAIM_COOLDOWN;
     }
 
     function _distributePreviousEpochs(uint256 newCurrentEpoch) internal {
